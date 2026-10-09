@@ -99,6 +99,12 @@ input.kcal{max-width:112px}
 .mg3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}
 
 .results{margin-top:8px;display:grid}
+.net{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+.net .btn{padding:10px 8px;font-size:14.5px}
+.sect{font-size:13px;font-weight:600;color:var(--muted);margin:12px 0 0}
+.scan{margin-top:10px;background:var(--soft);border-radius:14px;padding:12px}
+.scan video{width:100%;aspect-ratio:4/3;object-fit:cover;border-radius:10px;background:#000;display:block}
+.scan .note{margin:8px 0}
 .res-i{display:flex;justify-content:space-between;gap:10px;text-align:left;background:none;border:0;border-bottom:1px solid var(--line);padding:10px 2px;width:100%}
 .res-i span:first-child{overflow-wrap:anywhere}
 .res-i span:last-child{color:var(--muted);font-size:13px;white-space:nowrap}
@@ -198,7 +204,22 @@ label{font-size:13.5px;color:var(--muted);display:grid;gap:4px}
 
     <div id="paneSearch">
       <input id="q" type="search" placeholder="Busca un alimento: pollo, arroz, manzana…" autocomplete="off" aria-label="Buscar alimento">
+      <div class="net">
+        <button class="btn ghost" id="netBtn" type="button">Buscar en internet</button>
+        <button class="btn ghost" id="scanBtn" type="button">Escanear código</button>
+      </div>
+      <div class="scan" id="scan" hidden>
+        <video id="vid" playsinline muted></video>
+        <p class="note" id="scanMsg"></p>
+        <div class="row">
+          <input id="codeIn" type="text" inputmode="numeric" placeholder="O escribe el código de barras" aria-label="Código de barras">
+          <button class="btn" id="codeGo" type="button">Buscar</button>
+        </div>
+        <button class="btn ghost full" id="scanClose" type="button">Cerrar</button>
+      </div>
       <div class="results" id="results"></div>
+      <p class="sect" id="netHead" hidden>Resultados de internet</p>
+      <div class="results" id="netRes"></div>
       <div class="ai-box" id="aiBox" hidden></div>
       <div class="port" id="port" hidden></div>
     </div>
@@ -710,6 +731,7 @@ label{font-size:13.5px;color:var(--muted);display:grid;gap:4px}
   function renderResults(){
     var q = $("q").value.trim();
     var box = $("results"); box.innerHTML = "";
+    $("netRes").innerHTML = ""; $("netHead").hidden = true;
     var ai = $("aiBox"); ai.hidden = true; ai.innerHTML = "";
     if (!q){ return; }
     var res = search(q);
@@ -749,6 +771,106 @@ label{font-size:13.5px;color:var(--muted);display:grid;gap:4px}
     }
   }
 
+  /* ---------- Open Food Facts ---------- */
+  var OFF = "https://world.openfoodfacts.org";
+  var OFF_FIELDS = "code,product_name,product_name_es,brands,nutriments,serving_size,serving_quantity";
+  function getJson(url){
+    var ctl = new AbortController();
+    var t = setTimeout(function(){ ctl.abort(); }, 12000);
+    return fetch(url, { signal: ctl.signal }).then(function(r){
+      clearTimeout(t);
+      if (!r.ok) throw new Error("http");
+      return r.json();
+    });
+  }
+  function offToFood(p){
+    var n = p.nutriments || {};
+    var k = n["energy-kcal_100g"];
+    if ((k == null || k === "") && n["energy_100g"] != null) k = n["energy_100g"] / 4.184;
+    if (k == null || k === "" || isNaN(+k)) return null;
+    var name = String(p.product_name_es || p.product_name || "").trim();
+    if (!name) return null;
+    if (p.brands) name += " (" + String(p.brands).split(",")[0].trim() + ")";
+    var sq = parseFloat(p.serving_quantity);
+    var hasS = sq > 0 && sq < 2000;
+    var sz = p.serving_size ? String(p.serving_size).slice(0, 28) : "";
+    return {
+      n: name, k: +k, p: +n.proteins_100g || 0, c: +n.carbohydrates_100g || 0, f: +n.fat_100g || 0,
+      u: hasS ? "1 porción" + (sz ? " (" + sz + ")" : "") : "100 g",
+      g: hasS ? sq : 100, src: "Open Food Facts"
+    };
+  }
+  function netSearch(){
+    var q = $("q").value.trim();
+    if (q.length < 2){ toast("Escribe qué quieres buscar"); $("q").focus(); return; }
+    var btn = $("netBtn"); btn.disabled = true; var old = btn.textContent; btn.textContent = "Buscando…";
+    var url = OFF + "/cgi/search.pl?search_terms=" + encodeURIComponent(q) +
+      "&search_simple=1&action=process&json=1&page_size=15&fields=" + OFF_FIELDS;
+    getJson(url).then(function(d){
+      var foods = (d.products || []).map(offToFood).filter(Boolean).slice(0, 10);
+      var box = $("netRes"); box.innerHTML = "";
+      $("netHead").hidden = false;
+      if (!foods.length){ box.appendChild(el("p", "empty", "Sin resultados con datos de calorías. Prueba otro nombre o el modo Manual.")); return; }
+      foods.forEach(function(f){
+        var b = el("button", "res-i"); b.type = "button";
+        b.appendChild(el("span", null, f.n));
+        b.appendChild(el("span", null, fmt(f.k) + " kcal / 100 g"));
+        b.onclick = function(){ pick(f); };
+        box.appendChild(b);
+      });
+    }).catch(function(){
+      toast("No pude conectar. Revisa tu internet e inténtalo de nuevo.");
+    }).then(function(){ btn.disabled = false; btn.textContent = old; });
+  }
+  function lookup(code){
+    code = String(code).replace(/\D/g, "");
+    if (code.length < 6){ toast("Código de barras no válido"); return; }
+    toast("Buscando producto…");
+    getJson(OFF + "/api/v2/product/" + code + ".json?fields=" + OFF_FIELDS).then(function(d){
+      if (d.status !== 1 || !d.product){ toast("No encontré ese código. Usa el modo Manual."); return; }
+      var f = offToFood(d.product);
+      if (!f){ toast("Encontré el producto, pero sin calorías registradas."); return; }
+      pick(f);
+    }).catch(function(){ toast("No pude conectar. Revisa tu internet e inténtalo de nuevo."); });
+  }
+  var stream = null, scanTimer = null;
+  function closeScan(){
+    clearInterval(scanTimer); scanTimer = null;
+    if (stream){ stream.getTracks().forEach(function(t){ t.stop(); }); stream = null; }
+    $("vid").srcObject = null; $("scan").hidden = true;
+  }
+  async function openScan(){
+    $("scan").hidden = false; $("vid").hidden = false; $("codeIn").value = "";
+    var msg = $("scanMsg");
+    if (!("BarcodeDetector" in window) || !navigator.mediaDevices){
+      $("vid").hidden = true;
+      msg.textContent = "Este navegador no puede escanear. Escribe el código que aparece bajo las barras.";
+      return;
+    }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+      var v = $("vid"); v.srcObject = stream; await v.play();
+      var det = new BarcodeDetector({ formats: ["ean_13","ean_8","upc_a","upc_e"] });
+      msg.textContent = "Apunta la cámara al código de barras.";
+      scanTimer = setInterval(async function(){
+        try {
+          var r = await det.detect(v);
+          if (r && r.length){ var code = r[0].rawValue; closeScan(); lookup(code); }
+        } catch(e){}
+      }, 400);
+    } catch(e){
+      $("vid").hidden = true;
+      msg.textContent = "No pude abrir la cámara. Revisa el permiso o escribe el código.";
+    }
+  }
+  $("netBtn").onclick = netSearch;
+  $("scanBtn").onclick = openScan;
+  $("scanClose").onclick = closeScan;
+  $("codeGo").onclick = function(){ var c = $("codeIn").value; closeScan(); lookup(c); };
+  $("codeIn").addEventListener("keydown", function(e){ if (e.key === "Enter") $("codeGo").click(); });
+  $("q").addEventListener("keydown", function(e){ if (e.key === "Enter") { e.preventDefault(); netSearchIfEmpty(); } });
+  function netSearchIfEmpty(){ if (!$("results").children.length) netSearch(); }
+
   function calcPort(){
     var qty = parseFloat(($("pq").value || "").replace(",", "."));
     var unit = $("pu").value;
@@ -772,7 +894,7 @@ label{font-size:13.5px;color:var(--muted);display:grid;gap:4px}
     sel = f;
     var box = $("port"); box.hidden = false; box.innerHTML = "";
     var h = el("h3", null, f.n);
-    if (f.ai) h.appendChild(el("span", "tag", "estimado"));
+    if (f.ai || f.src) h.appendChild(el("span", "tag", f.ai ? "estimado" : "internet"));
     box.appendChild(h);
     var grid = el("div", "pgrid");
     var qty = el("input"); qty.id = "pq"; qty.type = "number"; qty.inputMode = "decimal"; qty.step = "0.25"; qty.min = "0"; qty.value = "1";
@@ -791,6 +913,7 @@ label{font-size:13.5px;color:var(--muted);display:grid;gap:4px}
     box.appendChild(pv);
     var g = el("p", "note", ""); g.id = "pvg"; g.style.marginTop = "8px"; box.appendChild(g);
     if (f.ai) box.appendChild(el("p", "note", "Valores aproximados: una estimación puede variar según la receta y la porción real."));
+    if (f.src) box.appendChild(el("p", "note", "Datos de " + f.src + ", aportados por la comunidad. Verifica con la etiqueta del producto."));
     var add = el("button", "btn full"); add.type = "button"; add.id = "pAdd";
     add.onclick = function(){
       var r = calcPort();
